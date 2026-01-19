@@ -30,6 +30,8 @@ A terminal application for interacting with Todoist, built in Rust with a modern
 
 ## Installation
 
+[![Packaging status](https://repology.org/badge/vertical-allrepos/terminalist.svg)](https://repology.org/project/terminalist/versions)
+
 ### Option 1: Install from Homebrew (macOS & Linux)
 
 ```bash
