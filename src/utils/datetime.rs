@@ -160,6 +160,38 @@ pub fn format_human_datetime(datetime_str: &str) -> String {
     }
 }
 
+/// Normalize common date abbreviations to forms the Todoist API understands.
+///
+/// The Todoist app handles abbreviations like "tmrw" client-side before
+/// sending to the API. This function replicates that behavior.
+pub fn normalize_due_string(input: &str) -> String {
+    let words: Vec<&str> = input.split_whitespace().collect();
+    if words.is_empty() {
+        return input.to_string();
+    }
+
+    let expanded: Vec<String> = words
+        .iter()
+        .map(|w| {
+            match w.to_lowercase().as_str() {
+                "tmrw" | "tmr" | "tom" | "tmw" => "tomorrow".to_string(),
+                "tod" | "tdy" => "today".to_string(),
+                "yday" | "yest" => "yesterday".to_string(),
+                "mon" => "monday".to_string(),
+                "tue" | "tues" => "tuesday".to_string(),
+                "wed" => "wednesday".to_string(),
+                "thu" | "thur" | "thurs" => "thursday".to_string(),
+                "fri" => "friday".to_string(),
+                "sat" => "saturday".to_string(),
+                "sun" => "sunday".to_string(),
+                _ => w.to_string(), // preserve original casing for unknowns
+            }
+        })
+        .collect();
+
+    expanded.join(" ")
+}
+
 /// Get a human-readable weekday name
 fn weekday_name(weekday: Weekday) -> &'static str {
     match weekday {

@@ -27,6 +27,7 @@ pub enum Action {
     SetTaskDueTomorrow(Uuid),
     SetTaskDueNextWeek(Uuid),
     SetTaskDueWeekEnd(Uuid),
+    SetTaskDueString(Uuid, String),
     CreateTask {
         content: String,
         project_uuid: Option<Uuid>,
@@ -128,4 +129,7 @@ pub enum DialogType {
     Help,
     Logs,
     TaskSearch,
+    TaskDueDateInput {
+        task_uuid: Uuid,
+    },
 }

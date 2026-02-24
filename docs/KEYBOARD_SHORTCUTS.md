@@ -18,6 +18,7 @@ This document lists all available keyboard shortcuts and TUI controls.
 - **`T`** Set task due date to tomorrow
 - **`w`** Set task due date to next week (Monday)
 - **`W`** Set task due date to next week end (Saturday)
+- **`s`** Set due date (natural language input, e.g. "next friday", "march 15", "in 3 days")
 
 ## Project Management
 

@@ -249,6 +249,16 @@ impl DialogComponent {
                     Action::None
                 }
             }
+            Some(DialogType::TaskDueDateInput { task_uuid }) => {
+                let due_string = if self.input_buffer.trim().is_empty() {
+                    "no date".to_string()
+                } else {
+                    crate::utils::datetime::normalize_due_string(&self.input_buffer)
+                };
+                let action = Action::SetTaskDueString(*task_uuid, due_string);
+                self.clear_dialog();
+                action
+            }
             Some(DialogType::DeleteConfirmation { item_type, item_uuid }) => match item_type.as_str() {
                 "task" => {
                     let action = Action::DeleteTask(item_uuid.to_string());
@@ -489,6 +499,10 @@ impl DialogComponent {
 
         let results_list_widget = List::new(results_list).block(results_block);
         f.render_widget(results_list_widget, layout[1]);
+    }
+
+    fn render_due_date_input_dialog(&self, f: &mut Frame, area: Rect) {
+        task_dialogs::render_due_date_input_dialog(f, area, &self.input_buffer, self.cursor_position);
     }
 
     fn render_logs_dialog(&mut self, f: &mut Frame, area: Rect) {
@@ -896,6 +910,9 @@ impl Component for DialogComponent {
                 }
                 DialogType::TaskSearch => {
                     self.render_task_search_dialog(f, rect);
+                }
+                DialogType::TaskDueDateInput { .. } => {
+                    self.render_due_date_input_dialog(f, rect);
                 }
             }
         }

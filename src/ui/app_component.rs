@@ -406,6 +406,15 @@ impl AppComponent {
                     Action::ShowDialog(DialogType::Info(UI_NO_TASK_SELECTED_DUE_DATE.to_string()))
                 }
             }
+            KeyCode::Char('s') => {
+                if let Some(task) = self.task_list.get_selected_task() {
+                    info!("Global key: 's' - opening due date input for task '{}'", task.content);
+                    Action::ShowDialog(DialogType::TaskDueDateInput { task_uuid: task.uuid })
+                } else {
+                    info!("Global key: 's' - no task selected");
+                    Action::ShowDialog(DialogType::Info(UI_NO_TASK_SELECTED_DUE_DATE.to_string()))
+                }
+            }
             KeyCode::Esc => {
                 if self.dialog.is_visible() {
                     info!("Global key: Esc - closing dialog");
@@ -633,6 +642,14 @@ impl AppComponent {
                 };
                 info!("Task: Setting due date to weekend for task {}", task_desc);
                 self.spawn_task_operation("Set task due weekend".to_string(), format!("{}|weekend", task_id_str));
+                Action::None
+            }
+            Action::SetTaskDueString(task_uuid, due_string) => {
+                info!("Task: Setting due date string '{}' for task {}", due_string, task_uuid);
+                self.spawn_task_operation(
+                    "Set task due string".to_string(),
+                    format!("{}|{}", task_uuid, due_string),
+                );
                 Action::None
             }
             Action::EditTask { task_uuid, content } => {
@@ -940,6 +957,21 @@ impl AppComponent {
                                     match sync_service.update_task_due_date(&task_uuid, Some(&next_saturday_str)).await
                                     {
                                         Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DUE_SATURDAY, task_id_str)),
+                                        Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
+                                    }
+                                }
+                                Err(e) => Err(format!("Invalid task UUID: {}", e)),
+                            }
+                        } else {
+                            Err(ERROR_INVALID_DATE_FORMAT.to_string())
+                        }
+                    }
+                    "Set task due string" => {
+                        if let Some((task_id_str, due_string)) = task_info.split_once('|') {
+                            match Uuid::parse_str(task_id_str) {
+                                Ok(task_uuid) => {
+                                    match sync_service.update_task_due_string(&task_uuid, due_string).await {
+                                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DUE_STRING_SET, due_string)),
                                         Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
                                     }
                                 }

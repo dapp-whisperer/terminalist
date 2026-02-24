@@ -125,6 +125,7 @@ pub struct UpdateTaskArgs {
     pub priority: Option<i32>,
     pub due_date: Option<String>,
     pub due_datetime: Option<String>,
+    pub due_string: Option<String>,
     pub duration: Option<String>,
     pub labels: Option<Vec<String>>,
 }

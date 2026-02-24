@@ -252,6 +252,7 @@ impl SyncService {
             priority: None,
             due_date: None,
             due_datetime: None,
+            due_string: None,
             duration: None,
             labels: None,
         };
@@ -289,6 +290,7 @@ impl SyncService {
             priority: None,
             due_date: due_date.map(std::string::ToString::to_string),
             due_datetime: None,
+            due_string: None,
             duration: None,
             labels: None,
         };
@@ -311,6 +313,46 @@ impl SyncService {
         Ok(())
     }
 
+    /// Update task due date using a natural language string via Todoist's due_string API.
+    /// The API parses the string and returns the resolved date, which is used to update local storage.
+    pub async fn update_task_due_string(&self, task_uuid: &Uuid, due_string: &str) -> Result<()> {
+        let remote_id = self.get_task_remote_id(task_uuid).await?;
+
+        let task_args = crate::backend::UpdateTaskArgs {
+            content: None,
+            description: None,
+            project_remote_id: None,
+            section_remote_id: None,
+            parent_remote_id: None,
+            priority: None,
+            due_date: None,
+            due_datetime: None,
+            due_string: Some(due_string.to_string()),
+            duration: None,
+            labels: None,
+        };
+        let backend_task = self
+            .get_backend()
+            .await?
+            .update_task(&remote_id, task_args)
+            .await
+            .map_err(|e| anyhow::anyhow!("Backend error: {}", e))?;
+
+        // Update local storage from the API response (resolved date fields)
+        let storage = self.storage.lock().await;
+
+        if let Some(task) = TaskRepository::get_by_id(&storage.conn, task_uuid).await? {
+            let mut active_model: task::ActiveModel = task.into_active_model();
+            active_model.due_date = ActiveValue::Set(backend_task.due_date);
+            active_model.due_datetime = ActiveValue::Set(backend_task.due_datetime);
+            active_model.is_recurring = ActiveValue::Set(backend_task.is_recurring);
+            active_model.deadline = ActiveValue::Set(backend_task.deadline);
+            TaskRepository::update(&storage.conn, active_model).await?;
+        }
+
+        Ok(())
+    }
+
     /// Update task priority
     pub async fn update_task_priority(&self, task_uuid: &Uuid, priority: i32) -> Result<()> {
         // Look up the task's remote_id for backend call
@@ -326,6 +368,7 @@ impl SyncService {
             priority: Some(priority),
             due_date: None,
             due_datetime: None,
+            due_string: None,
             duration: None,
             labels: None,
         };

@@ -254,6 +254,7 @@ impl Backend for TodoistBackend {
             priority: args.priority,
             due_date: args.due_date,
             due_datetime: args.due_datetime,
+            due_string: args.due_string,
             labels: args.labels,
             duration: args.duration.as_ref().and_then(|d| {
                 // UpdateTaskArgs.duration is Option<i32> (just the amount)
