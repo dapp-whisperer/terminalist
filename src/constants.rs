@@ -18,6 +18,7 @@ pub const SUCCESS_TASK_DUE_TODAY: &str = "✅ Task due date set to today";
 pub const SUCCESS_TASK_DUE_TOMORROW: &str = "✅ Task due date set to tomorrow";
 pub const SUCCESS_TASK_DUE_MONDAY: &str = "✅ Task due date set to next Monday";
 pub const SUCCESS_TASK_DUE_SATURDAY: &str = "✅ Task due date set to next Saturday";
+pub const SUCCESS_TASK_DUE_STRING_SET: &str = "✅ Task due date updated";
 pub const SUCCESS_PROJECT_CREATED_PARENT: &str = "✅ Project created with parent";
 pub const SUCCESS_PROJECT_CREATED_ROOT: &str = "✅ Root project created";
 pub const SUCCESS_PROJECT_DELETED: &str = "✅ Project deleted";
