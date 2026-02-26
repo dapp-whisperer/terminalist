@@ -7,6 +7,7 @@
 use crate::config::DisplayConfig;
 use crate::entities::{label, project, task};
 use crate::icons::IconService;
+use crate::sync::tasks::ProjectUpdateIntent;
 use crate::sync::SyncService;
 use crate::ui::components::task_list_item_component::{ListItem as TaskListItem, TaskItem};
 use crate::ui::core::{
@@ -18,6 +19,38 @@ use ratatui::{layout::Rect, widgets::ScrollbarState, Frame};
 use uuid::Uuid;
 
 use crate::ui::components::dialogs::{label_dialogs, project_dialogs, scroll_behavior, system_dialogs, task_dialogs};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ActiveTaskField {
+    TaskName,
+    Description,
+    DueDate,
+    Project,
+}
+
+impl ActiveTaskField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::TaskName => Self::Description,
+            Self::Description => Self::DueDate,
+            Self::DueDate => Self::Project,
+            Self::Project => Self::TaskName,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::TaskName => Self::Project,
+            Self::Description => Self::TaskName,
+            Self::DueDate => Self::Description,
+            Self::Project => Self::DueDate,
+        }
+    }
+
+    pub fn is_text_input(self) -> bool {
+        !matches!(self, Self::Project)
+    }
+}
 
 /// Modal dialog component that handles various user interactions.
 ///
@@ -44,6 +77,12 @@ pub struct DialogComponent {
     pub dialog_type: Option<DialogType>,
     pub input_buffer: String,
     pub cursor_position: usize,
+    pub active_task_field: ActiveTaskField,
+    pub description_buffer: String,
+    pub description_cursor: usize,
+    pub due_date_buffer: String,
+    pub due_date_cursor: usize,
+    original_due_date_buffer: String,
     pub projects: Vec<project::Model>,
     pub labels: Vec<label::Model>,
     pub tasks: Vec<task::Model>,
@@ -74,6 +113,12 @@ impl DialogComponent {
             dialog_type: None,
             input_buffer: String::new(),
             cursor_position: 0,
+            active_task_field: ActiveTaskField::TaskName,
+            description_buffer: String::new(),
+            description_cursor: 0,
+            due_date_buffer: String::new(),
+            due_date_cursor: 0,
+            original_due_date_buffer: String::new(),
             projects: Vec::new(),
             labels: Vec::new(),
             tasks: Vec::new(),
@@ -143,17 +188,101 @@ impl DialogComponent {
         self.dialog_type.is_some()
     }
 
+    fn is_task_form_dialog(&self) -> bool {
+        matches!(
+            self.dialog_type,
+            Some(DialogType::TaskCreation { .. } | DialogType::TaskEdit { .. })
+        )
+    }
+
+    fn active_buffer_mut(&mut self) -> (&mut String, &mut usize) {
+        match self.active_task_field {
+            ActiveTaskField::TaskName => (&mut self.input_buffer, &mut self.cursor_position),
+            ActiveTaskField::Description => (&mut self.description_buffer, &mut self.description_cursor),
+            ActiveTaskField::DueDate => (&mut self.due_date_buffer, &mut self.due_date_cursor),
+            ActiveTaskField::Project => unreachable!("Project is not a text input"),
+        }
+    }
+
+    fn cycle_task_project_selection(&mut self, forward: bool) {
+        let (next_index, next_project_uuid) = {
+            let task_projects = self.get_task_projects();
+            if task_projects.is_empty() {
+                self.selected_task_project_index = None;
+                self.selected_task_project_uuid = None;
+                return;
+            }
+
+            let project_count = task_projects.len();
+            let total_slots = project_count + 1; // includes Inbox/None
+            let current_slot = self.selected_task_project_index.unwrap_or(project_count);
+            let next_slot = if forward {
+                (current_slot + 1) % total_slots
+            } else if current_slot == 0 {
+                total_slots - 1
+            } else {
+                current_slot - 1
+            };
+
+            if next_slot == project_count {
+                (None, None)
+            } else {
+                (Some(next_slot), Some(task_projects[next_slot].uuid))
+            }
+        };
+
+        if let Some(project_uuid) = next_project_uuid {
+            self.selected_task_project_index = next_index;
+            self.selected_task_project_uuid = Some(project_uuid);
+        } else {
+            self.selected_task_project_index = None;
+            self.selected_task_project_uuid = None;
+        }
+        self.task_project_explicitly_selected = true;
+    }
+
+    fn insert_char(buffer: &mut String, cursor: &mut usize, c: char) {
+        let byte_pos: usize = buffer.chars().take(*cursor).map(|ch| ch.len_utf8()).sum();
+        buffer.insert(byte_pos, c);
+        *cursor += 1;
+    }
+
+    fn backspace_char(buffer: &mut String, cursor: &mut usize) {
+        if *cursor == 0 {
+            return;
+        }
+        let byte_pos: usize = buffer.chars().take(*cursor).map(|ch| ch.len_utf8()).sum();
+        let prev_char_len = buffer.chars().nth(*cursor - 1).map(|ch| ch.len_utf8()).unwrap_or(1);
+        buffer.remove(byte_pos - prev_char_len);
+        *cursor -= 1;
+    }
+
+    fn delete_char(buffer: &mut String, cursor: usize) {
+        let char_count = buffer.chars().count();
+        if cursor >= char_count {
+            return;
+        }
+        let byte_pos: usize = buffer.chars().take(cursor).map(|ch| ch.len_utf8()).sum();
+        buffer.remove(byte_pos);
+    }
+
     fn handle_submit(&mut self) -> Action {
         match &self.dialog_type {
             Some(DialogType::TaskCreation { default_project_uuid }) => {
-                if !self.input_buffer.is_empty() {
+                let content = self.input_buffer.trim().to_string();
+                if !content.is_empty() {
                     // Determine the project UUID based on whether user explicitly selected via Tab
                     let project_uuid = if self.task_project_explicitly_selected {
                         // User pressed Tab - use their selection (could be None for Inbox or Some(uuid) for a project)
                         self.selected_task_project_uuid
                     } else {
-                        // User didn't press Tab - use default project
-                        *default_project_uuid
+                        // User didn't press Tab - use default project only if it still exists in current project list
+                        default_project_uuid.and_then(|project_uuid| {
+                            self.get_task_projects()
+                                .iter()
+                                .any(|project| project.uuid == project_uuid)
+                                .then_some(project_uuid)
+                        })
                     };
 
                     // Debug logging
@@ -170,7 +299,17 @@ impl DialogComponent {
                     }
 
                     let action = Action::CreateTask {
-                        content: self.input_buffer.clone(),
+                        content,
+                        description: if self.description_buffer.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.description_buffer.trim().to_string())
+                        },
+                        due_string: if self.due_date_buffer.trim().is_empty() {
+                            None
+                        } else {
+                            Some(crate::utils::datetime::normalize_due_string(&self.due_date_buffer))
+                        },
                         project_uuid,
                     };
                     self.clear_dialog();
@@ -180,10 +319,36 @@ impl DialogComponent {
                 }
             }
             Some(DialogType::TaskEdit { task_uuid, .. }) => {
-                if !self.input_buffer.is_empty() {
+                let content = self.input_buffer.trim().to_string();
+                if !content.is_empty() {
+                    let due_string = {
+                        let current_due = self.due_date_buffer.trim();
+                        let original_due = self.original_due_date_buffer.trim();
+
+                        if current_due == original_due {
+                            None
+                        } else if current_due.is_empty() {
+                            Some("no date".to_string())
+                        } else {
+                            Some(crate::utils::datetime::normalize_due_string(&self.due_date_buffer))
+                        }
+                    };
+
                     let action = Action::EditTask {
                         task_uuid: *task_uuid,
-                        content: self.input_buffer.clone(),
+                        content,
+                        description: Some(self.description_buffer.trim().to_string()),
+                        due_string,
+                        project_update: if self.task_project_explicitly_selected {
+                            match self.selected_task_project_uuid.filter(|project_uuid| {
+                                self.get_task_projects().iter().any(|project| project.uuid == *project_uuid)
+                            }) {
+                                Some(project_uuid) => ProjectUpdateIntent::Set(project_uuid),
+                                None => ProjectUpdateIntent::MoveToInbox,
+                            }
+                        } else {
+                            ProjectUpdateIntent::Unchanged
+                        },
                     };
                     self.clear_dialog();
                     action
@@ -285,6 +450,12 @@ impl DialogComponent {
         self.dialog_type = None;
         self.input_buffer.clear();
         self.cursor_position = 0;
+        self.active_task_field = ActiveTaskField::TaskName;
+        self.description_buffer.clear();
+        self.description_cursor = 0;
+        self.due_date_buffer.clear();
+        self.due_date_cursor = 0;
+        self.original_due_date_buffer.clear();
         self.selected_project_index = 0;
         self.selected_parent_project_index = None;
         self.selected_task_project_index = None; // Reset to "None" for task creation
@@ -327,8 +498,13 @@ impl DialogComponent {
             &self.icons,
             &self.input_buffer,
             self.cursor_position,
+            &self.description_buffer,
+            self.description_cursor,
+            &self.due_date_buffer,
+            self.due_date_cursor,
             &task_projects,
             self.selected_task_project_index,
+            self.active_task_field,
         );
     }
 
@@ -359,22 +535,19 @@ impl DialogComponent {
 
     fn render_task_edit_dialog(&self, f: &mut Frame, area: Rect) {
         let task_projects = self.get_task_projects();
-
-        // Find the current project index for the task being edited
-        let current_project_index = if let Some(DialogType::TaskEdit { project_uuid, .. }) = &self.dialog_type {
-            task_projects.iter().position(|p| p.uuid == *project_uuid)
-        } else {
-            None
-        };
-
         task_dialogs::render_task_edit_dialog(
             f,
             area,
             &self.icons,
             &self.input_buffer,
             self.cursor_position,
+            &self.description_buffer,
+            self.description_cursor,
+            &self.due_date_buffer,
+            self.due_date_cursor,
             &task_projects,
-            current_project_index,
+            self.selected_task_project_index,
+            self.active_task_field,
         );
     }
 
@@ -682,104 +855,9 @@ impl Component for DialogComponent {
                 match key.code {
                     KeyCode::Esc => Action::HideDialog,
                     KeyCode::Enter => self.handle_submit(),
-                    KeyCode::Char(c) => {
-                        let byte_pos: usize = self
-                            .input_buffer
-                            .chars()
-                            .take(self.cursor_position)
-                            .map(|ch| ch.len_utf8())
-                            .sum();
-                        self.input_buffer.insert(byte_pos, c);
-                        self.cursor_position += 1;
-                        Action::None
-                    }
-                    KeyCode::Backspace => {
-                        if self.cursor_position > 0 {
-                            let byte_pos: usize = self
-                                .input_buffer
-                                .chars()
-                                .take(self.cursor_position)
-                                .map(|ch| ch.len_utf8())
-                                .sum();
-                            let prev_char_len = self
-                                .input_buffer
-                                .chars()
-                                .nth(self.cursor_position - 1)
-                                .map(|ch| ch.len_utf8())
-                                .unwrap_or(1);
-                            self.input_buffer.remove(byte_pos - prev_char_len);
-                            self.cursor_position -= 1;
-                        }
-                        Action::None
-                    }
-                    KeyCode::Delete => {
-                        let char_count = self.input_buffer.chars().count();
-                        if self.cursor_position < char_count {
-                            let byte_pos: usize = self
-                                .input_buffer
-                                .chars()
-                                .take(self.cursor_position)
-                                .map(|ch| ch.len_utf8())
-                                .sum();
-                            self.input_buffer.remove(byte_pos);
-                        }
-                        Action::None
-                    }
-                    KeyCode::Left => {
-                        if self.cursor_position > 0 {
-                            self.cursor_position -= 1;
-                        }
-                        Action::None
-                    }
-                    KeyCode::Right => {
-                        let char_count = self.input_buffer.chars().count();
-                        if self.cursor_position < char_count {
-                            self.cursor_position += 1;
-                        }
-                        Action::None
-                    }
                     KeyCode::Tab => {
-                        if matches!(self.dialog_type, Some(DialogType::TaskCreation { .. })) {
-                            let task_projects = self.get_task_projects();
-                            if !task_projects.is_empty() {
-                                // Clone needed data to avoid borrow issues
-                                let projects_data: Vec<(Uuid, String)> =
-                                    task_projects.iter().map(|p| (p.uuid, p.name.clone())).collect();
-
-                                // Mark that user has explicitly selected a project via Tab
-                                self.task_project_explicitly_selected = true;
-
-                                self.selected_task_project_index = match self.selected_task_project_index {
-                                    None => {
-                                        // First tab: select first project
-                                        self.selected_task_project_uuid = Some(projects_data[0].0);
-                                        log::info!(
-                                            "Tab: Selected project {} ({})",
-                                            projects_data[0].1,
-                                            projects_data[0].0
-                                        );
-                                        Some(0)
-                                    }
-                                    Some(index) => {
-                                        let next_index = (index + 1) % (projects_data.len() + 1);
-                                        if next_index == projects_data.len() {
-                                            // Cycle back to "None" option (inbox)
-                                            self.selected_task_project_uuid = None;
-                                            log::info!("Tab: Selected inbox (no project)");
-                                            None
-                                        } else {
-                                            // Select the project at next_index
-                                            self.selected_task_project_uuid = Some(projects_data[next_index].0);
-                                            log::info!(
-                                                "Tab: Selected project {} ({})",
-                                                projects_data[next_index].1,
-                                                projects_data[next_index].0
-                                            );
-                                            Some(next_index)
-                                        }
-                                    }
-                                };
-                            }
+                        if self.is_task_form_dialog() {
+                            self.active_task_field = self.active_task_field.next();
                         } else if matches!(self.dialog_type, Some(DialogType::ProjectCreation)) {
                             let root_projects = self.get_root_projects();
                             if !root_projects.is_empty() {
@@ -798,6 +876,87 @@ impl Component for DialogComponent {
                         }
                         Action::None
                     }
+                    KeyCode::BackTab => {
+                        if self.is_task_form_dialog() {
+                            self.active_task_field = self.active_task_field.prev();
+                        }
+                        Action::None
+                    }
+                    KeyCode::Up => {
+                        if self.is_task_form_dialog() && self.active_task_field == ActiveTaskField::Project {
+                            self.cycle_task_project_selection(false);
+                        }
+                        Action::None
+                    }
+                    KeyCode::Down => {
+                        if self.is_task_form_dialog() && self.active_task_field == ActiveTaskField::Project {
+                            self.cycle_task_project_selection(true);
+                        }
+                        Action::None
+                    }
+                    KeyCode::Char(c) => {
+                        if self.is_task_form_dialog() {
+                            if self.active_task_field.is_text_input() {
+                                let (buffer, cursor) = self.active_buffer_mut();
+                                Self::insert_char(buffer, cursor, c);
+                            }
+                        } else {
+                            Self::insert_char(&mut self.input_buffer, &mut self.cursor_position, c);
+                        }
+                        Action::None
+                    }
+                    KeyCode::Backspace => {
+                        if self.is_task_form_dialog() {
+                            if self.active_task_field.is_text_input() {
+                                let (buffer, cursor) = self.active_buffer_mut();
+                                Self::backspace_char(buffer, cursor);
+                            }
+                        } else {
+                            Self::backspace_char(&mut self.input_buffer, &mut self.cursor_position);
+                        }
+                        Action::None
+                    }
+                    KeyCode::Delete => {
+                        if self.is_task_form_dialog() {
+                            if self.active_task_field.is_text_input() {
+                                let (buffer, cursor) = self.active_buffer_mut();
+                                Self::delete_char(buffer, *cursor);
+                            }
+                        } else {
+                            Self::delete_char(&mut self.input_buffer, self.cursor_position);
+                        }
+                        Action::None
+                    }
+                    KeyCode::Left => {
+                        if self.is_task_form_dialog() {
+                            if self.active_task_field.is_text_input() {
+                                let (_, cursor) = self.active_buffer_mut();
+                                if *cursor > 0 {
+                                    *cursor -= 1;
+                                }
+                            }
+                        } else if self.cursor_position > 0 {
+                            self.cursor_position -= 1;
+                        }
+                        Action::None
+                    }
+                    KeyCode::Right => {
+                        if self.is_task_form_dialog() {
+                            if self.active_task_field.is_text_input() {
+                                let (buffer, cursor) = self.active_buffer_mut();
+                                let char_count = buffer.chars().count();
+                                if *cursor < char_count {
+                                    *cursor += 1;
+                                }
+                            }
+                        } else {
+                            let char_count = self.input_buffer.chars().count();
+                            if self.cursor_position < char_count {
+                                self.cursor_position += 1;
+                            }
+                        }
+                        Action::None
+                    }
                     _ => Action::None,
                 }
             }
@@ -812,9 +971,41 @@ impl Component for DialogComponent {
 
                 // Pre-populate input for edit dialogs
                 match &dialog_type {
-                    DialogType::TaskEdit { content, .. } => {
+                    DialogType::TaskEdit {
+                        content,
+                        description,
+                        due_date,
+                        project_uuid,
+                        ..
+                    } => {
                         self.input_buffer = content.clone();
                         self.cursor_position = content.chars().count();
+                        self.description_buffer = description.clone();
+                        self.description_cursor = description.chars().count();
+                        self.due_date_buffer = due_date.clone();
+                        self.due_date_cursor = due_date.chars().count();
+                        self.original_due_date_buffer = due_date.clone();
+                        self.active_task_field = ActiveTaskField::TaskName;
+
+                        if let Some(project_uuid) = project_uuid {
+                            let task_projects = self.get_task_projects();
+                            if let Some(index) = task_projects.iter().position(|project| &project.uuid == project_uuid)
+                            {
+                                self.selected_task_project_index = Some(index);
+                                self.selected_task_project_uuid = Some(*project_uuid);
+                            } else {
+                                self.selected_task_project_index = None;
+                                self.selected_task_project_uuid = None;
+                                log::warn!(
+                                    "Task edit opened with unavailable project {}; falling back to Inbox",
+                                    project_uuid
+                                );
+                            }
+                        } else {
+                            self.selected_task_project_index = None;
+                            self.selected_task_project_uuid = None;
+                        }
+                        self.task_project_explicitly_selected = false;
                     }
                     DialogType::ProjectEdit { name, .. } => {
                         self.input_buffer = name.clone();
@@ -827,6 +1018,12 @@ impl Component for DialogComponent {
                     DialogType::TaskCreation { default_project_uuid } => {
                         self.input_buffer.clear();
                         self.cursor_position = 0;
+                        self.description_buffer.clear();
+                        self.description_cursor = 0;
+                        self.due_date_buffer.clear();
+                        self.due_date_cursor = 0;
+                        self.original_due_date_buffer.clear();
+                        self.active_task_field = ActiveTaskField::TaskName;
                         // Set the selected task project index and UUID if a default project is provided
                         if let Some(project_uuid) = default_project_uuid {
                             let task_projects = self.get_task_projects();
@@ -840,10 +1037,20 @@ impl Component for DialogComponent {
                                     .map(|p| p.name.as_str())
                                     .unwrap_or("unknown");
                                 log::info!("Dialog opened with default project: {} ({})", proj_name, project_uuid);
+                            } else {
+                                self.selected_task_project_index = None;
+                                self.selected_task_project_uuid = None;
+                                log::warn!(
+                                    "Task creation opened with unavailable default project {}; falling back to Inbox",
+                                    project_uuid
+                                );
                             }
                         } else {
+                            self.selected_task_project_index = None;
+                            self.selected_task_project_uuid = None;
                             log::info!("Dialog opened with no default project (inbox)");
                         }
+                        self.task_project_explicitly_selected = false;
                     }
                     DialogType::TaskSearch => {
                         self.input_buffer.clear();
@@ -853,6 +1060,12 @@ impl Component for DialogComponent {
                     _ => {
                         self.input_buffer.clear();
                         self.cursor_position = 0;
+                        self.description_buffer.clear();
+                        self.description_cursor = 0;
+                        self.due_date_buffer.clear();
+                        self.due_date_cursor = 0;
+                        self.original_due_date_buffer.clear();
+                        self.active_task_field = ActiveTaskField::TaskName;
                     }
                 }
                 self.dialog_type = Some(dialog_type.clone());

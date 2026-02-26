@@ -1,3 +1,4 @@
+use crate::sync::tasks::ProjectUpdateIntent;
 use crate::sync::SyncStatus;
 use uuid::Uuid;
 
@@ -30,11 +31,16 @@ pub enum Action {
     SetTaskDueString(Uuid, String),
     CreateTask {
         content: String,
+        description: Option<String>,
+        due_string: Option<String>,
         project_uuid: Option<Uuid>,
     },
     EditTask {
         task_uuid: Uuid,
         content: String,
+        description: Option<String>,
+        due_string: Option<String>,
+        project_update: ProjectUpdateIntent,
     },
     RestoreTask(String),
 
@@ -108,7 +114,9 @@ pub enum DialogType {
     TaskEdit {
         task_uuid: Uuid,
         content: String,
-        project_uuid: Uuid,
+        description: String,
+        due_date: String,
+        project_uuid: Option<Uuid>,
     },
     ProjectCreation,
     ProjectEdit {

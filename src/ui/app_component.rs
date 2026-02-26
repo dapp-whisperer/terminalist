@@ -1,18 +1,21 @@
 use crate::config::Config;
 use crate::constants::*;
 use crate::entities::{label, project, section, task};
+use crate::logger;
+use crate::sync::tasks::ProjectUpdateIntent;
 use crate::sync::{SyncService, SyncStatus};
 use crate::ui::components::{DialogComponent, SidebarComponent, TaskListComponent};
 use crate::ui::core::SidebarSelection;
 use crate::ui::core::{
     actions::{Action, DialogType},
+    error_sanitizer::sanitize_user_error,
     event_handler::EventType,
     task_manager::{TaskId, TaskManager},
     Component,
 };
 use crate::utils::datetime;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use log::info;
+use log::{debug, error, info};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     Frame,
@@ -86,7 +89,82 @@ pub struct AppComponent {
     screen_height: u16,
 }
 
+#[derive(Debug, Clone)]
+enum TaskOperation {
+    Create {
+        content: String,
+        description: Option<String>,
+        due_string: Option<String>,
+        project_uuid: Option<Uuid>,
+    },
+    Edit {
+        task_uuid: Uuid,
+        content: String,
+        description: Option<String>,
+        due_string: Option<String>,
+        project_update: ProjectUpdateIntent,
+    },
+    Complete {
+        task_uuid: Uuid,
+    },
+    Delete {
+        task_uuid: Uuid,
+    },
+    CyclePriority {
+        task_uuid: Uuid,
+        new_priority: i32,
+    },
+    SetDueDate {
+        task_uuid: Uuid,
+        due_date: String,
+        success_message: &'static str,
+    },
+    SetDueString {
+        task_uuid: Uuid,
+        due_string: String,
+    },
+    Restore {
+        task_uuid: Uuid,
+    },
+    CreateProject {
+        name: String,
+        parent_uuid: Option<Uuid>,
+    },
+    DeleteProject {
+        project_uuid: Uuid,
+    },
+    DeleteLabel {
+        label_uuid: Uuid,
+    },
+    CreateLabel {
+        name: String,
+    },
+    EditProject {
+        project_uuid: Uuid,
+        name: String,
+    },
+    EditLabel {
+        label_uuid: Uuid,
+        name: String,
+    },
+}
+
 impl AppComponent {
+    fn should_include_raw_user_content_in_debug_logs() -> bool {
+        cfg!(debug_assertions) && std::env::var("TERMINALIST_LOG_RAW_USER_CONTENT").ok().as_deref() == Some("1")
+    }
+
+    fn redacted_text(input: &str) -> String {
+        logger::redact_user_text_for_log(input)
+    }
+
+    fn redacted_optional_text(input: Option<&str>) -> String {
+        match input {
+            Some(value) => Self::redacted_text(value),
+            None => "None".to_string(),
+        }
+    }
+
     pub fn new(sync_service: SyncService, config: Config) -> Self {
         let sidebar = SidebarComponent::new();
         let task_list = TaskListComponent::new();
@@ -465,11 +543,11 @@ impl AppComponent {
                 Action::ShowDialog(DialogType::Info(self.state.info_message.clone().unwrap()))
             }
             Action::SyncFailed(error) => {
-                info!("Sync: Failed with error: {}", error);
+                error!("Sync: Failed with internal error: {}", error);
                 self.active_sync_task = None;
                 self.state.loading = false;
                 self.is_initial_sync = false; // Reset flag on failure
-                self.state.error_message = Some(error);
+                self.state.error_message = Some(sanitize_user_error(&error, ERROR_SYNC_FAILED));
                 Action::ShowDialog(DialogType::Error(self.state.error_message.clone().unwrap_or_default()))
             }
             Action::ShowDialog(ref dialog_type) => {
@@ -512,19 +590,31 @@ impl AppComponent {
                 Action::None
             }
             // Task operations with background execution
-            Action::CreateTask { content, project_uuid } => {
+            Action::CreateTask {
+                content,
+                description,
+                due_string,
+                project_uuid,
+            } => {
                 let project_desc = match &project_uuid {
                     Some(uuid) => format!(" in project {}", uuid),
                     None => " in inbox".to_string(),
                 };
-                info!("Task: Creating task with content '{}'{}", content, project_desc);
+                info!(
+                    "Task: Creating task with content {}{}",
+                    Self::redacted_text(&content),
+                    project_desc
+                );
+                if Self::should_include_raw_user_content_in_debug_logs() {
+                    debug!("Task create raw content: {}", logger::sanitize_for_log(&content));
+                }
 
-                // Format task info to include both content and project_uuid
-                let task_info = match project_uuid {
-                    Some(pid) => format!("{}|{}", content, pid),
-                    None => content,
-                };
-                self.spawn_task_operation("Create task".to_string(), task_info);
+                self.spawn_task_operation(TaskOperation::Create {
+                    content,
+                    description,
+                    due_string,
+                    project_uuid,
+                });
                 Action::None
             }
             Action::CompleteTask(task_id) => {
@@ -537,7 +627,7 @@ impl AppComponent {
                         info!("Task: Completing task {}", task_desc);
 
                         // Todoist API automatically handles subtasks when parent is completed
-                        self.spawn_task_operation("Complete task".to_string(), task_id);
+                        self.spawn_task_operation(TaskOperation::Complete { task_uuid });
                     } else {
                         info!("Task: Cannot complete - task {} not found", task_id);
                     }
@@ -561,10 +651,10 @@ impl AppComponent {
                             task_id, task.content, task.priority, new_priority
                         );
                         info!("Task: Cycling priority for task {}", task_desc);
-                        self.spawn_task_operation(
-                            "Cycle priority".to_string(),
-                            format!("{}|{}", task_id, new_priority),
-                        );
+                        self.spawn_task_operation(TaskOperation::CyclePriority {
+                            task_uuid,
+                            new_priority,
+                        });
                     } else {
                         info!("Task: Cannot cycle priority - task {} not found", task_id);
                     }
@@ -586,80 +676,128 @@ impl AppComponent {
                     format!("ID {} [invalid UUID]", task_id)
                 };
                 info!("Task: Deleting task {}", task_desc);
-                self.spawn_task_operation("Delete task".to_string(), task_id);
+                if let Ok(task_uuid) = Uuid::parse_str(&task_id) {
+                    self.spawn_task_operation(TaskOperation::Delete { task_uuid });
+                } else {
+                    info!("Task: Cannot delete - invalid UUID {}", task_id);
+                }
                 Action::None
             }
             Action::SetTaskDueToday(task_id) => {
                 // Find task name for better logging
                 let sync_service = self.sync_service.clone();
-                let task_id_str = task_id.to_string();
                 let task_desc = if let Ok(Some(task)) = sync_service.get_task_by_id(&task_id).await {
                     format!("ID {} '{}'", task_id, task.content)
                 } else {
                     format!("ID {} [unknown]", task_id)
                 };
                 info!("Task: Setting due date to today for task {}", task_desc);
-                self.spawn_task_operation("Set task due today".to_string(), format!("{}|today", task_id_str));
+                self.spawn_task_operation(TaskOperation::SetDueDate {
+                    task_uuid: task_id,
+                    due_date: datetime::format_today(),
+                    success_message: SUCCESS_TASK_DUE_TODAY,
+                });
                 Action::None
             }
             Action::SetTaskDueTomorrow(task_id) => {
                 // Find task name for better logging
                 let sync_service = self.sync_service.clone();
-                let task_id_str = task_id.to_string();
                 let task_desc = if let Ok(Some(task)) = sync_service.get_task_by_id(&task_id).await {
                     format!("ID {} '{}'", task_id, task.content)
                 } else {
                     format!("ID {} [unknown]", task_id)
                 };
                 info!("Task: Setting due date to tomorrow for task {}", task_desc);
-                self.spawn_task_operation("Set task due tomorrow".to_string(), format!("{}|tomorrow", task_id_str));
+                self.spawn_task_operation(TaskOperation::SetDueDate {
+                    task_uuid: task_id,
+                    due_date: datetime::format_date_with_offset(1),
+                    success_message: SUCCESS_TASK_DUE_TOMORROW,
+                });
                 Action::None
             }
             Action::SetTaskDueNextWeek(task_id) => {
                 // Find task name for better logging
                 let sync_service = self.sync_service.clone();
-                let task_id_str = task_id.to_string();
                 let task_desc = if let Ok(Some(task)) = sync_service.get_task_by_id(&task_id).await {
                     format!("ID {} '{}'", task_id, task.content)
                 } else {
                     format!("ID {} [unknown]", task_id)
                 };
                 info!("Task: Setting due date to next week for task {}", task_desc);
-                self.spawn_task_operation(
-                    "Set task due next week".to_string(),
-                    format!("{}|next_week", task_id_str),
-                );
+                self.spawn_task_operation(TaskOperation::SetDueDate {
+                    task_uuid: task_id,
+                    due_date: Self::next_weekday_due_date_from(chrono::Local::now().date_naive(), chrono::Weekday::Mon),
+                    success_message: SUCCESS_TASK_DUE_MONDAY,
+                });
                 Action::None
             }
             Action::SetTaskDueWeekEnd(task_id) => {
                 // Find task name for better logging
                 let sync_service = self.sync_service.clone();
-                let task_id_str = task_id.to_string();
                 let task_desc = if let Ok(Some(task)) = sync_service.get_task_by_id(&task_id).await {
                     format!("ID {} '{}'", task_id, task.content)
                 } else {
                     format!("ID {} [unknown]", task_id)
                 };
                 info!("Task: Setting due date to weekend for task {}", task_desc);
-                self.spawn_task_operation("Set task due weekend".to_string(), format!("{}|weekend", task_id_str));
+                self.spawn_task_operation(TaskOperation::SetDueDate {
+                    task_uuid: task_id,
+                    due_date: Self::next_weekday_due_date_from(chrono::Local::now().date_naive(), chrono::Weekday::Sat),
+                    success_message: SUCCESS_TASK_DUE_SATURDAY,
+                });
                 Action::None
             }
             Action::SetTaskDueString(task_uuid, due_string) => {
-                info!("Task: Setting due date string '{}' for task {}", due_string, task_uuid);
-                self.spawn_task_operation(
-                    "Set task due string".to_string(),
-                    format!("{}|{}", task_uuid, due_string),
+                info!(
+                    "Task: Setting due date string {} for task {}",
+                    Self::redacted_text(&due_string),
+                    task_uuid
                 );
+                if Self::should_include_raw_user_content_in_debug_logs() {
+                    debug!(
+                        "Task due string raw value for {}: {}",
+                        task_uuid,
+                        logger::sanitize_for_log(&due_string)
+                    );
+                }
+                self.spawn_task_operation(TaskOperation::SetDueString { task_uuid, due_string });
                 Action::None
             }
-            Action::EditTask { task_uuid, content } => {
-                info!("Task: Editing task UUID {} with new content '{}'", task_uuid, content);
-                self.spawn_task_operation("Edit task".to_string(), format!("{}: {}", task_uuid, content));
+            Action::EditTask {
+                task_uuid,
+                content,
+                description,
+                due_string,
+                project_update,
+            } => {
+                info!(
+                    "Task: Editing task UUID {} with new content {}",
+                    task_uuid,
+                    Self::redacted_text(&content)
+                );
+                if Self::should_include_raw_user_content_in_debug_logs() {
+                    debug!(
+                        "Task edit raw content for {}: {}",
+                        task_uuid,
+                        logger::sanitize_for_log(&content)
+                    );
+                }
+                self.spawn_task_operation(TaskOperation::Edit {
+                    task_uuid,
+                    content,
+                    description,
+                    due_string,
+                    project_update,
+                });
                 Action::None
             }
             Action::RestoreTask(task_id) => {
                 info!("Task: Restoring task {}", task_id);
-                self.spawn_task_operation("Restore task".to_string(), task_id);
+                if let Ok(task_uuid) = Uuid::parse_str(&task_id) {
+                    self.spawn_task_operation(TaskOperation::Restore { task_uuid });
+                } else {
+                    info!("Task: Cannot restore - invalid UUID {}", task_id);
+                }
                 Action::None
             }
             Action::CreateProject { name, parent_uuid } => {
@@ -669,12 +807,7 @@ impl AppComponent {
                 };
                 info!("Project: Creating project '{}'{}", name, parent_desc);
 
-                // Format project info to include both name and parent_uuid
-                let project_info = match parent_uuid {
-                    Some(pid) => format!("{}|{}", name, pid),
-                    None => name,
-                };
-                self.spawn_task_operation("Create project".to_string(), project_info);
+                self.spawn_task_operation(TaskOperation::CreateProject { name, parent_uuid });
                 Action::None
             }
             Action::DeleteProject(project_id) => {
@@ -685,7 +818,9 @@ impl AppComponent {
                     format!("ID {} [unknown]", project_id)
                 };
                 info!("Project: Deleting project {}", project_desc);
-                self.spawn_task_operation("Delete project".to_string(), project_id.to_string());
+                self.spawn_task_operation(TaskOperation::DeleteProject {
+                    project_uuid: project_id,
+                });
                 Action::None
             }
             Action::DeleteLabel(label_id) => {
@@ -696,12 +831,12 @@ impl AppComponent {
                     format!("ID {} [unknown]", label_id)
                 };
                 info!("Label: Deleting label {}", label_desc);
-                self.spawn_task_operation("Delete label".to_string(), label_id.to_string());
+                self.spawn_task_operation(TaskOperation::DeleteLabel { label_uuid: label_id });
                 Action::None
             }
             Action::CreateLabel { name } => {
                 info!("Label: Creating label '{}'", name);
-                self.spawn_task_operation("Create label".to_string(), name);
+                self.spawn_task_operation(TaskOperation::CreateLabel { name });
                 Action::None
             }
             Action::EditProject { project_uuid, name } => {
@@ -712,7 +847,7 @@ impl AppComponent {
                     format!("UUID {} [unknown] -> '{}'", project_uuid, name)
                 };
                 info!("Project: Editing project {}", project_desc);
-                self.spawn_task_operation("Edit project".to_string(), format!("{}: {}", project_uuid, name));
+                self.spawn_task_operation(TaskOperation::EditProject { project_uuid, name });
                 Action::None
             }
             Action::EditLabel { label_uuid, name } => {
@@ -723,7 +858,7 @@ impl AppComponent {
                     format!("UUID {} [unknown] -> '{}'", label_uuid, name)
                 };
                 info!("Label: Editing label {}", label_desc);
-                self.spawn_task_operation("Edit label".to_string(), format!("{}: {}", label_uuid, name));
+                self.spawn_task_operation(TaskOperation::EditLabel { label_uuid, name });
                 Action::None
             }
             Action::InitialDataLoaded {
@@ -845,256 +980,196 @@ impl AppComponent {
         self.active_sync_task = Some(task_id);
     }
 
-    /// Spawn a generic task operation (now with actual API calls and data refresh)
-    fn spawn_task_operation(&mut self, operation_name: String, task_info: String) {
-        let description = format!("{}: {}", operation_name, task_info);
-        let op_name = operation_name.clone();
+    fn task_create_success_prefix(project_uuid: Option<Uuid>) -> &'static str {
+        if project_uuid.is_some() {
+            SUCCESS_TASK_CREATED_PROJECT
+        } else {
+            SUCCESS_TASK_CREATED_INBOX
+        }
+    }
+
+    fn next_weekday_due_date_from(today: chrono::NaiveDate, weekday: chrono::Weekday) -> String {
+        let next_due_date = crate::utils::datetime::next_weekday(today, weekday);
+        crate::utils::datetime::format_ymd(next_due_date)
+    }
+
+    /// Spawn a task operation in the background (with API call and data refresh).
+    fn spawn_task_operation(&mut self, operation: TaskOperation) {
+        let description = match &operation {
+            TaskOperation::Create {
+                content,
+                description,
+                due_string,
+                project_uuid,
+            } => format!(
+                "Create task: content={}, description={}, due_string={}, project_uuid={:?}",
+                Self::redacted_text(content),
+                Self::redacted_optional_text(description.as_deref()),
+                Self::redacted_optional_text(due_string.as_deref()),
+                project_uuid
+            ),
+            TaskOperation::Edit {
+                task_uuid,
+                content,
+                description,
+                due_string,
+                project_update,
+            } => format!(
+                "Edit task: task_uuid={}, content={}, description={}, due_string={}, project_update={:?}",
+                task_uuid,
+                Self::redacted_text(content),
+                Self::redacted_optional_text(description.as_deref()),
+                Self::redacted_optional_text(due_string.as_deref()),
+                project_update
+            ),
+            TaskOperation::Complete { task_uuid } => format!("Complete task: {}", task_uuid),
+            TaskOperation::Delete { task_uuid } => format!("Delete task: {}", task_uuid),
+            TaskOperation::CyclePriority {
+                task_uuid,
+                new_priority,
+            } => format!("Cycle priority: task_uuid={}, new_priority={}", task_uuid, new_priority),
+            TaskOperation::SetDueDate {
+                task_uuid, due_date, ..
+            } => format!("Set due date: task_uuid={}, due_date={}", task_uuid, due_date),
+            TaskOperation::SetDueString { task_uuid, due_string } => format!(
+                "Set due string: task_uuid={}, due_string={}",
+                task_uuid,
+                Self::redacted_text(due_string)
+            ),
+            TaskOperation::Restore { task_uuid } => format!("Restore task: {}", task_uuid),
+            TaskOperation::CreateProject { name, parent_uuid } => {
+                format!("Create project: name='{}', parent_uuid={:?}", name, parent_uuid)
+            }
+            TaskOperation::DeleteProject { project_uuid } => format!("Delete project: {}", project_uuid),
+            TaskOperation::DeleteLabel { label_uuid } => format!("Delete label: {}", label_uuid),
+            TaskOperation::CreateLabel { name } => format!("Create label: name='{}'", name),
+            TaskOperation::EditProject { project_uuid, name } => {
+                format!("Edit project: project_uuid={}, name='{}'", project_uuid, name)
+            }
+            TaskOperation::EditLabel { label_uuid, name } => {
+                format!("Edit label: label_uuid={}, name='{}'", label_uuid, name)
+            }
+        };
         let sync_service = self.sync_service.clone();
         info!("Background: Spawning task operation '{}'", description);
 
+        if Self::should_include_raw_user_content_in_debug_logs() {
+            debug!("Background task operation raw payload enabled for local debug only");
+        }
+
         let _task_id = self.task_manager.spawn_task_operation(
             move || async move {
-                let result = match op_name.as_str() {
-                    "Complete task" => match Uuid::parse_str(&task_info) {
-                        Ok(task_uuid) => match sync_service.complete_task(&task_uuid).await {
-                            Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_COMPLETED, task_info)),
-                            Err(e) => Err(format!("{}: {}", ERROR_TASK_COMPLETION_FAILED, e)),
-                        },
-                        Err(e) => Err(format!("Invalid task UUID: {}", e)),
+                let result = match operation {
+                    TaskOperation::Create {
+                        content,
+                        description,
+                        due_string,
+                        project_uuid,
+                    } => match sync_service
+                        .create_task(&content, description.as_deref(), due_string.as_deref(), project_uuid)
+                        .await
+                    {
+                        Ok(()) => Ok(format!(
+                            "{}: {}",
+                            AppComponent::task_create_success_prefix(project_uuid),
+                            content
+                        )),
+                        Err(e) => Err(format!("{}: {}", ERROR_TASK_CREATE_FAILED, e)),
                     },
-                    "Delete task" => match Uuid::parse_str(&task_info) {
-                        Ok(task_uuid) => match sync_service.delete_task(&task_uuid).await {
-                            Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DELETED, task_info)),
-                            Err(e) => Err(format!("{}: {}", ERROR_TASK_DELETE_FAILED, e)),
-                        },
-                        Err(e) => Err(format!("Invalid task UUID: {}", e)),
+                    TaskOperation::Edit {
+                        task_uuid,
+                        content,
+                        description,
+                        due_string,
+                        project_update,
+                    } => match sync_service
+                        .update_task_full(
+                            &task_uuid,
+                            &content,
+                            description.as_deref(),
+                            due_string.as_deref(),
+                            project_update,
+                        )
+                        .await
+                    {
+                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_UPDATED, task_uuid)),
+                        Err(e) => Err(format!("{}: {}", ERROR_TASK_UPDATE_FAILED, e)),
                     },
-                    "Cycle priority" => {
-                        // task_info format: "task_id|new_priority"
-                        if let Some((task_id_str, priority_str)) = task_info.split_once('|') {
-                            match Uuid::parse_str(task_id_str) {
-                                Ok(task_uuid) => {
-                                    if let Ok(priority) = priority_str.parse::<i32>() {
-                                        match sync_service.update_task_priority(&task_uuid, priority).await {
-                                            Ok(()) => Ok(format!(
-                                                "{}{}: {}",
-                                                SUCCESS_TASK_PRIORITY_UPDATED, priority, task_id_str
-                                            )),
-                                            Err(e) => Err(format!("{}: {}", ERROR_TASK_PRIORITY_FAILED, e)),
-                                        }
-                                    } else {
-                                        Err(ERROR_INVALID_PRIORITY_FORMAT.to_string())
-                                    }
-                                }
-                                Err(e) => Err(format!("Invalid task UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_PRIORITY_INFO.to_string())
-                        }
-                    }
-                    "Set task due today" => {
-                        // task_info format: "task_id|today"
-                        if let Some((task_id_str, _)) = task_info.split_once('|') {
-                            match Uuid::parse_str(task_id_str) {
-                                Ok(task_uuid) => {
-                                    let today = datetime::format_today();
-                                    match sync_service.update_task_due_date(&task_uuid, Some(&today)).await {
-                                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DUE_TODAY, task_id_str)),
-                                        Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
-                                    }
-                                }
-                                Err(e) => Err(format!("Invalid task UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_DATE_FORMAT.to_string())
-                        }
-                    }
-                    "Set task due tomorrow" => {
-                        // task_info format: "task_id|tomorrow"
-                        if let Some((task_id_str, _)) = task_info.split_once('|') {
-                            match Uuid::parse_str(task_id_str) {
-                                Ok(task_uuid) => {
-                                    let tomorrow = datetime::format_date_with_offset(1);
-                                    match sync_service.update_task_due_date(&task_uuid, Some(&tomorrow)).await {
-                                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DUE_TOMORROW, task_id_str)),
-                                        Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
-                                    }
-                                }
-                                Err(e) => Err(format!("Invalid task UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_DATE_FORMAT.to_string())
-                        }
-                    }
-                    "Set task due next week" => {
-                        // task_info format: "task_id|next_week"
-                        if let Some((task_id_str, _)) = task_info.split_once('|') {
-                            match Uuid::parse_str(task_id_str) {
-                                Ok(task_uuid) => {
-                                    let today = chrono::Local::now().date_naive();
-                                    let next_monday = crate::utils::datetime::next_weekday(today, chrono::Weekday::Mon);
-                                    let next_monday_str = crate::utils::datetime::format_ymd(next_monday);
-                                    match sync_service.update_task_due_date(&task_uuid, Some(&next_monday_str)).await {
-                                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DUE_MONDAY, task_id_str)),
-                                        Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
-                                    }
-                                }
-                                Err(e) => Err(format!("Invalid task UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_DATE_FORMAT.to_string())
-                        }
-                    }
-                    "Set task due weekend" => {
-                        // task_info format: "task_id|weekend"
-                        if let Some((task_id_str, _)) = task_info.split_once('|') {
-                            match Uuid::parse_str(task_id_str) {
-                                Ok(task_uuid) => {
-                                    let today = chrono::Local::now().date_naive();
-                                    let next_saturday =
-                                        crate::utils::datetime::next_weekday(today, chrono::Weekday::Sat);
-                                    let next_saturday_str = crate::utils::datetime::format_ymd(next_saturday);
-                                    match sync_service.update_task_due_date(&task_uuid, Some(&next_saturday_str)).await
-                                    {
-                                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DUE_SATURDAY, task_id_str)),
-                                        Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
-                                    }
-                                }
-                                Err(e) => Err(format!("Invalid task UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_DATE_FORMAT.to_string())
-                        }
-                    }
-                    "Set task due string" => {
-                        if let Some((task_id_str, due_string)) = task_info.split_once('|') {
-                            match Uuid::parse_str(task_id_str) {
-                                Ok(task_uuid) => {
-                                    match sync_service.update_task_due_string(&task_uuid, due_string).await {
-                                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DUE_STRING_SET, due_string)),
-                                        Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
-                                    }
-                                }
-                                Err(e) => Err(format!("Invalid task UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_DATE_FORMAT.to_string())
-                        }
-                    }
-                    "Create task" => {
-                        // task_info format: "content|project_id" or just "content" for inbox
-                        if let Some((content, project_id_str)) = task_info.split_once('|') {
-                            // Task has a specific project - parse the UUID
-                            match Uuid::parse_str(project_id_str) {
-                                Ok(project_uuid) => match sync_service.create_task(content, Some(project_uuid)).await {
-                                    Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_CREATED_PROJECT, content)),
-                                    Err(e) => Err(format!("{}: {}", ERROR_TASK_CREATE_FAILED, e)),
-                                },
-                                Err(e) => Err(format!("Invalid project UUID: {}", e)),
-                            }
-                        } else {
-                            // Task goes to inbox (no project_id)
-                            match sync_service.create_task(&task_info, None).await {
-                                Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_CREATED_INBOX, task_info)),
-                                Err(e) => Err(format!("{}: {}", ERROR_TASK_CREATE_FAILED, e)),
-                            }
-                        }
-                    }
-                    "Edit task" => {
-                        // task_info format: "task_id: new_content"
-                        if let Some((task_id_str, content)) = task_info.split_once(": ") {
-                            match Uuid::parse_str(task_id_str) {
-                                Ok(task_uuid) => match sync_service.update_task_content(&task_uuid, content).await {
-                                    Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_UPDATED, task_id_str)),
-                                    Err(e) => Err(format!("{}: {}", ERROR_TASK_UPDATE_FAILED, e)),
-                                },
-                                Err(e) => Err(format!("Invalid task UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_TASK_EDIT_FORMAT.to_string())
-                        }
-                    }
-                    "Restore task" => match Uuid::parse_str(&task_info) {
-                        Ok(task_uuid) => match sync_service.restore_task(&task_uuid).await {
-                            Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_RESTORED, task_info)),
-                            Err(e) => Err(format!("{}: {}", ERROR_TASK_RESTORE_FAILED, e)),
-                        },
-                        Err(e) => Err(format!("Invalid task UUID: {}", e)),
+                    TaskOperation::Complete { task_uuid } => match sync_service.complete_task(&task_uuid).await {
+                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_COMPLETED, task_uuid)),
+                        Err(e) => Err(format!("{}: {}", ERROR_TASK_COMPLETION_FAILED, e)),
                     },
-                    "Create project" => {
-                        // project_info format: "name|parent_id" or just "name" for root project
-                        if let Some((name, parent_id_str)) = task_info.split_once('|') {
-                            // Project has a parent - parse the UUID
-                            match Uuid::parse_str(parent_id_str) {
-                                Ok(parent_uuid) => match sync_service.create_project(name, Some(parent_uuid)).await {
-                                    Ok(()) => Ok(format!("{}: {}", SUCCESS_PROJECT_CREATED_PARENT, name)),
-                                    Err(e) => Err(format!("{}: {}", ERROR_PROJECT_CREATE_FAILED, e)),
-                                },
-                                Err(e) => Err(format!("Invalid parent project UUID: {}", e)),
+                    TaskOperation::Delete { task_uuid } => match sync_service.delete_task(&task_uuid).await {
+                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DELETED, task_uuid)),
+                        Err(e) => Err(format!("{}: {}", ERROR_TASK_DELETE_FAILED, e)),
+                    },
+                    TaskOperation::CyclePriority {
+                        task_uuid,
+                        new_priority,
+                    } => match sync_service.update_task_priority(&task_uuid, new_priority).await {
+                        Ok(()) => Ok(format!(
+                            "{}{}: {}",
+                            SUCCESS_TASK_PRIORITY_UPDATED, new_priority, task_uuid
+                        )),
+                        Err(e) => Err(format!("{}: {}", ERROR_TASK_PRIORITY_FAILED, e)),
+                    },
+                    TaskOperation::SetDueDate {
+                        task_uuid,
+                        due_date,
+                        success_message,
+                    } => match sync_service.update_task_due_date(&task_uuid, Some(&due_date)).await {
+                        Ok(()) => Ok(format!("{}: {}", success_message, task_uuid)),
+                        Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
+                    },
+                    TaskOperation::SetDueString { task_uuid, due_string } => {
+                        match sync_service.update_task_due_string(&task_uuid, &due_string).await {
+                            Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_DUE_STRING_SET, due_string)),
+                            Err(e) => Err(format!("{}: {}", ERROR_TASK_DUE_DATE_FAILED, e)),
+                        }
+                    }
+                    TaskOperation::Restore { task_uuid } => match sync_service.restore_task(&task_uuid).await {
+                        Ok(()) => Ok(format!("{}: {}", SUCCESS_TASK_RESTORED, task_uuid)),
+                        Err(e) => Err(format!("{}: {}", ERROR_TASK_RESTORE_FAILED, e)),
+                    },
+                    TaskOperation::CreateProject { name, parent_uuid } => {
+                        match sync_service.create_project(&name, parent_uuid).await {
+                            Ok(()) => {
+                                let success_prefix = if parent_uuid.is_some() {
+                                    SUCCESS_PROJECT_CREATED_PARENT
+                                } else {
+                                    SUCCESS_PROJECT_CREATED_ROOT
+                                };
+                                Ok(format!("{}: {}", success_prefix, name))
                             }
-                        } else {
-                            // Root project (no parent)
-                            match sync_service.create_project(&task_info, None).await {
-                                Ok(()) => Ok(format!("{}: {}", SUCCESS_PROJECT_CREATED_ROOT, task_info)),
-                                Err(e) => Err(format!("{}: {}", ERROR_PROJECT_CREATE_FAILED, e)),
-                            }
+                            Err(e) => Err(format!("{}: {}", ERROR_PROJECT_CREATE_FAILED, e)),
                         }
                     }
-                    "Delete project" => {
-                        // task_info is a UUID string
-                        match Uuid::parse_str(&task_info) {
-                            Ok(project_uuid) => match sync_service.delete_project(&project_uuid).await {
-                                Ok(()) => Ok(format!("{}: {}", SUCCESS_PROJECT_DELETED, task_info)),
-                                Err(e) => Err(format!("{}: {}", ERROR_PROJECT_DELETE_FAILED, e)),
-                            },
-                            Err(e) => Err(format!("Invalid project UUID: {}", e)),
+                    TaskOperation::DeleteProject { project_uuid } => {
+                        match sync_service.delete_project(&project_uuid).await {
+                            Ok(()) => Ok(format!("{}: {}", SUCCESS_PROJECT_DELETED, project_uuid)),
+                            Err(e) => Err(format!("{}: {}", ERROR_PROJECT_DELETE_FAILED, e)),
                         }
                     }
-                    "Delete label" => {
-                        // task_info is a UUID string
-                        match Uuid::parse_str(&task_info) {
-                            Ok(label_uuid) => match sync_service.delete_label(&label_uuid).await {
-                                Ok(()) => Ok(format!("{}: {}", SUCCESS_LABEL_DELETED, task_info)),
-                                Err(e) => Err(format!("{}: {}", ERROR_LABEL_DELETE_FAILED, e)),
-                            },
-                            Err(e) => Err(format!("Invalid label UUID: {}", e)),
-                        }
-                    }
-                    "Create label" => match sync_service.create_label(&task_info).await {
-                        Ok(()) => Ok(format!("{}: {}", SUCCESS_LABEL_CREATED, task_info)),
+                    TaskOperation::DeleteLabel { label_uuid } => match sync_service.delete_label(&label_uuid).await {
+                        Ok(()) => Ok(format!("{}: {}", SUCCESS_LABEL_DELETED, label_uuid)),
+                        Err(e) => Err(format!("{}: {}", ERROR_LABEL_DELETE_FAILED, e)),
+                    },
+                    TaskOperation::CreateLabel { name } => match sync_service.create_label(&name).await {
+                        Ok(()) => Ok(format!("{}: {}", SUCCESS_LABEL_CREATED, name)),
                         Err(e) => Err(format!("{}: {}", ERROR_LABEL_CREATE_FAILED, e)),
                     },
-                    "Edit project" => {
-                        // task_info format: "project_id: new_name"
-                        if let Some((project_id_str, name)) = task_info.split_once(": ") {
-                            match Uuid::parse_str(project_id_str) {
-                                Ok(project_uuid) => {
-                                    match sync_service.update_project_content(&project_uuid, name).await {
-                                        Ok(()) => Ok(format!("{}: {}", SUCCESS_PROJECT_UPDATED, project_id_str)),
-                                        Err(e) => Err(format!("{}: {}", ERROR_PROJECT_UPDATE_FAILED, e)),
-                                    }
-                                }
-                                Err(e) => Err(format!("Invalid project UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_PROJECT_EDIT_FORMAT.to_string())
+                    TaskOperation::EditProject { project_uuid, name } => {
+                        match sync_service.update_project_content(&project_uuid, &name).await {
+                            Ok(()) => Ok(format!("{}: {}", SUCCESS_PROJECT_UPDATED, project_uuid)),
+                            Err(e) => Err(format!("{}: {}", ERROR_PROJECT_UPDATE_FAILED, e)),
                         }
                     }
-                    "Edit label" => {
-                        // task_info format: "label_id: new_name"
-                        if let Some((label_id_str, name)) = task_info.split_once(": ") {
-                            match Uuid::parse_str(label_id_str) {
-                                Ok(label_uuid) => match sync_service.update_label_content(&label_uuid, name).await {
-                                    Ok(()) => Ok(format!("{}: {}", SUCCESS_LABEL_UPDATED, label_id_str)),
-                                    Err(e) => Err(format!("{}: {}", ERROR_LABEL_UPDATE_FAILED, e)),
-                                },
-                                Err(e) => Err(format!("Invalid label UUID: {}", e)),
-                            }
-                        } else {
-                            Err(ERROR_INVALID_LABEL_EDIT_FORMAT.to_string())
+                    TaskOperation::EditLabel { label_uuid, name } => {
+                        match sync_service.update_label_content(&label_uuid, &name).await {
+                            Ok(()) => Ok(format!("{}: {}", SUCCESS_LABEL_UPDATED, label_uuid)),
+                            Err(e) => Err(format!("{}: {}", ERROR_LABEL_UPDATE_FAILED, e)),
                         }
                     }
-                    _ => Err(format!("{}: {}", ERROR_UNKNOWN_OPERATION, op_name)),
                 };
 
                 result.map_err(|e: String| anyhow::anyhow!(e))
@@ -1319,5 +1394,46 @@ impl AppComponent {
 
         f.render_widget(Clear, popup_area);
         f.render_widget(content, popup_area);
+    }
+}
+
+#[cfg(test)]
+mod due_date_tests {
+    use super::AppComponent;
+    use chrono::{NaiveDate, Weekday};
+
+    #[test]
+    fn next_weekday_due_date_from_uses_next_monday() {
+        let monday = NaiveDate::from_ymd_opt(2026, 2, 23).expect("valid date");
+        let next_monday = AppComponent::next_weekday_due_date_from(monday, Weekday::Mon);
+        assert_eq!(next_monday, "2026-03-02");
+    }
+
+    #[test]
+    fn next_weekday_due_date_from_uses_next_saturday() {
+        let saturday = NaiveDate::from_ymd_opt(2026, 2, 21).expect("valid date");
+        let next_saturday = AppComponent::next_weekday_due_date_from(saturday, Weekday::Sat);
+        assert_eq!(next_saturday, "2026-02-28");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_success_message_uses_inbox_context_without_project() {
+        assert_eq!(
+            AppComponent::task_create_success_prefix(None),
+            SUCCESS_TASK_CREATED_INBOX
+        );
+    }
+
+    #[test]
+    fn create_success_message_uses_project_context_with_project_uuid() {
+        assert_eq!(
+            AppComponent::task_create_success_prefix(Some(Uuid::new_v4())),
+            SUCCESS_TASK_CREATED_PROJECT
+        );
     }
 }

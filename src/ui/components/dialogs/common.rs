@@ -17,12 +17,22 @@ pub fn create_dialog_block<'a>(title: &'a str, theme_color: Color) -> Block<'a> 
 
 /// Creates an input field block with a visual cursor
 pub fn create_input_paragraph<'a>(input_buffer: &'a str, _cursor_position: usize, field_title: &str) -> Paragraph<'a> {
+    create_input_paragraph_styled(input_buffer, _cursor_position, field_title, false)
+}
+
+pub fn create_input_paragraph_styled<'a>(
+    input_buffer: &'a str,
+    _cursor_position: usize,
+    field_title: &str,
+    focused: bool,
+) -> Paragraph<'a> {
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(format!(" {} ", field_title))
         .title_style(Style::default().fg(Color::White))
-        .style(Style::default().fg(Color::Gray));
+        .style(Style::default().fg(border_color));
 
     Paragraph::new(input_buffer)
         .block(input_block)
@@ -31,12 +41,17 @@ pub fn create_input_paragraph<'a>(input_buffer: &'a str, _cursor_position: usize
 
 /// Creates a selection field block (read-only display with title)
 pub fn create_selection_paragraph(value: String, field_title: &str) -> Paragraph<'static> {
+    create_selection_paragraph_styled(value, field_title, false)
+}
+
+pub fn create_selection_paragraph_styled(value: String, field_title: &str, focused: bool) -> Paragraph<'static> {
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(format!(" {} ", field_title))
         .title_style(Style::default().fg(Color::White))
-        .style(Style::default().fg(Color::Gray));
+        .style(Style::default().fg(border_color));
 
     Paragraph::new(value).block(block).style(Style::default().fg(Color::White))
 }

@@ -44,6 +44,9 @@ pub const ERROR_LABEL_CREATE_FAILED: &str = "❌ Failed to create label";
 pub const ERROR_LABEL_DELETE_FAILED: &str = "❌ Failed to delete label";
 pub const ERROR_LABEL_UPDATE_FAILED: &str = "❌ Failed to update label";
 pub const ERROR_TASK_RESTORE_FAILED: &str = "❌ Failed to restore task";
+pub const ERROR_SYNC_FAILED: &str = "❌ Sync failed";
+pub const ERROR_OPERATION_FAILED: &str = "❌ Operation failed";
+pub const ERROR_DATA_LOAD_FAILED: &str = "❌ Failed to load data";
 
 // Validation Error Messages
 pub const ERROR_INVALID_PRIORITY_FORMAT: &str = "❌ Invalid priority value format";

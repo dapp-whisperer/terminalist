@@ -29,6 +29,7 @@
 pub mod actions;
 pub mod component;
 pub mod context;
+pub mod error_sanitizer;
 pub mod event_handler;
 pub mod task_manager;
 

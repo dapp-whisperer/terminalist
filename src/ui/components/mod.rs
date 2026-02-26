@@ -48,6 +48,7 @@ pub mod task_list_component;
 pub mod task_list_item_component;
 
 // Public exports for external use
+pub use dialog_component::ActiveTaskField;
 pub use dialog_component::DialogComponent;
 pub use sidebar_component::SidebarComponent;
 pub use task_list_component::TaskListComponent;

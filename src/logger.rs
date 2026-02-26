@@ -7,6 +7,26 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Replace control characters with visible escaped sequences.
+pub fn sanitize_for_log(input: &str) -> String {
+    let mut sanitized = String::with_capacity(input.len());
+
+    for ch in input.chars() {
+        if ch.is_control() {
+            sanitized.push_str(&format!("\\u{{{:04X}}}", ch as u32));
+        } else {
+            sanitized.push(ch);
+        }
+    }
+
+    sanitized
+}
+
+/// Redact user-entered text while preserving a small amount of metadata.
+pub fn redact_user_text_for_log(input: &str) -> String {
+    format!("[redacted len={}]", input.chars().count())
+}
+
 /// Global in-memory log storage for UI display
 static MEMORY_LOGS: once_cell::sync::Lazy<Arc<Mutex<VecDeque<String>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(VecDeque::with_capacity(5000))));

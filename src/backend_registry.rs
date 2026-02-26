@@ -307,4 +307,10 @@ impl BackendRegistry {
     pub fn storage(&self) -> Arc<Mutex<LocalStorage>> {
         self.storage.clone()
     }
+
+    #[cfg(test)]
+    pub async fn register_backend_for_test(&self, uuid: Uuid, backend: Box<dyn Backend>) {
+        let mut backends = self.backends.lock().await;
+        backends.insert(uuid, Arc::new(backend));
+    }
 }

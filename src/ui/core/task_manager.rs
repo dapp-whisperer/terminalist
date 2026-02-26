@@ -1,6 +1,8 @@
 use super::actions::{Action, SidebarSelection};
-use crate::constants::UI_LOADING_DATA_FROM_STORAGE;
+use super::error_sanitizer::sanitize_user_error;
+use crate::constants::{ERROR_DATA_LOAD_FAILED, ERROR_OPERATION_FAILED, UI_LOADING_DATA_FROM_STORAGE};
 use crate::sync::{SyncService, SyncStatus};
+use log::error;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -72,9 +74,9 @@ impl TaskManager {
                     Ok(result)
                 }
                 Err(e) => {
-                    let error_msg = e.to_string();
-                    let result = TaskResult::SyncFailed(error_msg.clone());
-                    let _ = action_sender.send(Action::SyncFailed(error_msg));
+                    let raw_error = e.to_string();
+                    let result = TaskResult::SyncFailed(raw_error.clone());
+                    let _ = action_sender.send(Action::SyncFailed(raw_error));
                     Ok(result)
                 }
             }
@@ -119,10 +121,12 @@ impl TaskManager {
                     Ok(result)
                 }
                 Err(e) => {
-                    let error_msg = format!("Operation failed: {}", e);
-                    let result = TaskResult::Other(error_msg.clone());
+                    let raw_error = format!("Operation failed: {}", e);
+                    error!("Background operation '{}' failed: {}", desc_clone, raw_error);
+                    let safe_error = sanitize_user_error(&raw_error, ERROR_OPERATION_FAILED);
+                    let result = TaskResult::Other(raw_error);
                     let _ = action_sender.send(Action::ShowDialog(crate::ui::core::actions::DialogType::Error(
-                        error_msg,
+                        safe_error,
                     )));
                     Ok(result)
                 }
@@ -248,11 +252,13 @@ impl TaskManager {
                     Ok(result)
                 }
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                    let error_msg = format!("Failed to load data: {}", e);
+                    let raw_error = format!("Failed to load data: {}", e);
+                    error!("Background data load failed: {}", raw_error);
+                    let safe_error = sanitize_user_error(&raw_error, ERROR_DATA_LOAD_FAILED);
                     let _ = action_sender.send(Action::ShowDialog(crate::ui::core::actions::DialogType::Error(
-                        error_msg.clone(),
+                        safe_error,
                     )));
-                    Ok(TaskResult::Other(error_msg))
+                    Ok(TaskResult::Other(raw_error))
                 }
             }
         });
